@@ -1,84 +1,56 @@
 name: PR
 
+# ARK-81 bench, engine variant: the "outrun as is" job (bench/outrun) with outrun's cache behind
+# Nx. Nx stays the task runner; `outrun nx-cache` serves Nx's self-hosted remote cache API from
+# outrun's cache (its namespace per bench round: input `cache`). ARM64 (outrun-linux-arm64).
+# Same changes vs upstream as bench/outrun: workflow_dispatch, no Nx Cloud agents, test:ci.
 on:
-  pull_request:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  NX_CLOUD_ACCESS_TOKEN: ${{ secrets.NX_CLOUD_ACCESS_TOKEN }}
+  workflow_dispatch:
+    inputs:
+      cache:
+        description: outrun cache namespace
+        required: false
+        default: outrun
 
 permissions: {}
+
+env:
+  NX_NO_CLOUD: "true"
+  OUTRUN_CACHE_URL: https://turbo-cache.arkadia.so
+  OUTRUN_CACHE_TEAM: ${{ inputs.cache || 'outrun' }}
+  NX_SELF_HOSTED_REMOTE_CACHE_SERVER: http://127.0.0.1:7070
+  # A replay is a download, not CPU: more at once than nx.json's 5 (also applies to cold runs).
+  NX_PARALLEL: "10"
 
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: outrun-linux-arm64
     permissions:
       contents: read
-      pull-requests: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Start Nx Agents
-        run: npx nx-cloud start-ci-run --distribute-on=".nx/workflows/dynamic-changesets.yaml"
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: Start outrun nx-cache
+        run: |
+          gunzip -c .github/outrun/outrun.js.gz > "$RUNNER_TEMP/outrun.js"
+          nohup bun "$RUNNER_TEMP/outrun.js" nx-cache --port 7070 > "$RUNNER_TEMP/nx-cache.log" 2>&1 &
+          for i in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:7070/v1/cache/0 && break; sleep 0.2; done
+          cat "$RUNNER_TEMP/nx-cache.log"
       - name: Setup Tools
         uses: TanStack/config/.github/setup@e4b48f16568324f76f467aa4c2aac2f05db632c3
-      - name: Get base and head commits for `nx affected`
-        uses: nrwl/nx-set-shas@3e9ad7370203c1e93d109be57f3b72eb0eb511b1 # v4.4.0
-        with:
-          main-branch-name: main
       - name: Run Checks
-        run: pnpm run test:pr
-      - name: Stop Nx Agents
-        if: ${{ always() }}
-        run: npx nx-cloud stop-all-agents
-  preview:
-    name: Preview
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - name: Setup Tools
-        uses: TanStack/config/.github/setup@e4b48f16568324f76f467aa4c2aac2f05db632c3
-      - name: Build Packages
-        run: pnpm run build:all
-      - name: Publish Previews
-        run: pnpx pkg-pr-new publish --pnpm --compact './packages/*' --template './examples/*/*'
-      - name: Determine commit SHA
-        id: determine-sha
-        run: echo "COMMIT_SHA=${COMMIT_SHA}" >> "$GITHUB_ENV"
-        env:
-          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Size Limit
-        uses: andresz1/size-limit-action@94bc357df29c36c8f8d50ea497c3e225c3c95d1d
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          skip_step: install
-          build_script: build:all
-  version-preview:
-    name: Version Preview
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - name: Setup Tools
-        uses: TanStack/config/.github/setup@e4b48f16568324f76f467aa4c2aac2f05db632c3
-      - name: Changeset Preview
-        uses: TanStack/config/.github/changeset-preview@466151b2d479656b38942cd84a0a3dce29d48de3
+        run: pnpm run test:ci
+      - name: nx-cache log
+        if: always()
+        run: |
+          grep -c . "$RUNNER_TEMP/nx-cache.log" || true
+          tail -20 "$RUNNER_TEMP/nx-cache.log"
