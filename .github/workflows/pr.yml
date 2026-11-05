@@ -1,32 +1,23 @@
 name: PR
 
-# ARK-81 bench, engine variant: the "outrun as is" job (bench/outrun) with outrun's cache behind
-# Nx. Nx stays the task runner; `outrun nx-cache` serves Nx's self-hosted remote cache API from
-# outrun's cache (its namespace per bench round: input `cache`). ARM64 (outrun-linux-arm64).
-# Same changes vs upstream as bench/outrun: workflow_dispatch, no Nx Cloud agents, test:ci.
-# bench/action: outrun from its published action (arkadia-so/outrun@v1), no committed CLI bundle.
+# bench/netdiag (ARK-25): not a bench. One job on outrun-linux-arm64 measuring DNS and TCP/TLS
+# connects to cache.outrun.sh and turbo-cache.arkadia.so, with curl and Bun's fetch (the action's
+# Bun 1.4.4 and setup-bun's), and the kernel's retransmit counters (.github/netdiag/netdiag.sh).
+# Named pr.yml so it can be dispatched on this branch (the fork's main has pr.yml).
 on:
   workflow_dispatch:
-    inputs:
-      cache:
-        description: outrun cache namespace
-        required: false
-        default: outrun
 
 permissions: {}
 
 env:
-  NX_NO_CLOUD: "true"
   OUTRUN_CACHE_URL: https://cache.outrun.sh
-  OUTRUN_CACHE_TEAM: ${{ inputs.cache || 'outrun' }}
-  NX_SELF_HOSTED_REMOTE_CACHE_SERVER: http://127.0.0.1:7070
-  # A replay is a download, not CPU: more at once than nx.json's 5 (also applies to cold runs).
-  NX_PARALLEL: "10"
+  OUTRUN_CACHE_TEAM: netdiag
 
 jobs:
-  test:
-    name: Test
+  netdiag:
+    name: netdiag
     runs-on: outrun-linux-arm64
+    timeout-minutes: 40
     permissions:
       contents: read
       id-token: write
@@ -34,23 +25,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          fetch-depth: 0
           persist-credentials: false
       - name: outrun
         uses: arkadia-so/outrun@v1
-      - name: Start outrun nx-cache
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: netdiag
         run: |
-          nohup outrun nx-cache --port 7070 > "$RUNNER_TEMP/nx-cache.log" 2>&1 &
-          for i in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:7070/v1/cache/0 && break; sleep 0.2; done
-          cat "$RUNNER_TEMP/nx-cache.log"
-      - name: Setup Tools
-        uses: TanStack/config/.github/setup@e4b48f16568324f76f467aa4c2aac2f05db632c3
-      - name: Run Checks
-        # Two upstream flakes left out (they fail on as is too): vue-query-devtools' client.test.ts
-        # (injection context) and nuxt3's typecheck racing its own `nuxt build` over .nuxt/.
-        run: pnpm run test:ci --exclude=@tanstack/vue-query-devtools,@tanstack/query-example-vue-simple-nuxt3
-      - name: nx-cache log
-        if: always()
-        run: |
-          grep -c . "$RUNNER_TEMP/nx-cache.log" || true
-          tail -20 "$RUNNER_TEMP/nx-cache.log"
+          BUN_ACTION=$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$(command -v outrun)")
+          BUN_SETUP=$(command -v bun)
+          OIDC=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://cache.outrun.sh" | jq -r .value)
+          echo "::add-mask::$OIDC"
+          export BUN_ACTION BUN_SETUP OIDC
+          echo "action bun: $BUN_ACTION, setup-bun: $BUN_SETUP"
+          .github/netdiag/netdiag.sh
