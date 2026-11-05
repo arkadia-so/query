@@ -1,26 +1,24 @@
 name: PR
 
-# bench/netdiag (ARK-25): not a bench. One job on outrun-linux-arm64 measuring DNS and TCP/TLS
-# connects to cache.outrun.sh and turbo-cache.arkadia.so, with curl and Bun's fetch (the action's
-# Bun 1.4.4 and setup-bun's), and the kernel's retransmit counters (.github/netdiag/netdiag.sh).
+# bench/netdiag (ARK-25): not a bench. Two jobs on outrun-linux-arm64.
+# - burst: bursts of new connections to cache.outrun.sh with curl and with Bun's fetch (the action's
+#   Bun 1.4.4), under a packet capture: are SYNs lost, and for which client (.github/netdiag/burst.sh).
+# - replay: bench/action's replay (36ae9b4, cache namespace action-1793910645) with its Run Checks
+#   under the same capture: what is pending during each silence (.github/netdiag/syn.py).
+# Run 1 (netdiag.sh, DNS and curl/Bun timings) is in this branch's history.
 # Named pr.yml so it can be dispatched on this branch (the fork's main has pr.yml).
 on:
   workflow_dispatch:
 
 permissions: {}
 
-env:
-  OUTRUN_CACHE_URL: https://cache.outrun.sh
-  OUTRUN_CACHE_TEAM: netdiag
-
 jobs:
-  netdiag:
-    name: netdiag
+  burst:
+    name: burst
     runs-on: outrun-linux-arm64
-    timeout-minutes: 40
+    timeout-minutes: 30
     permissions:
       contents: read
-      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -28,16 +26,63 @@ jobs:
           persist-credentials: false
       - name: outrun
         uses: arkadia-so/outrun@v1
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: 1.4.4
-      - name: netdiag
+      - name: burst
         run: |
           BUN_ACTION=$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$(command -v outrun)")
-          BUN_SETUP=$(command -v bun)
-          OIDC=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://cache.outrun.sh" | jq -r .value)
-          echo "::add-mask::$OIDC"
-          export BUN_ACTION BUN_SETUP OIDC
-          echo "action bun: $BUN_ACTION, setup-bun: $BUN_SETUP"
-          .github/netdiag/netdiag.sh
+          export BUN_ACTION
+          .github/netdiag/burst.sh
+
+  replay:
+    name: replay
+    runs-on: outrun-linux-arm64
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NX_NO_CLOUD: "true"
+      OUTRUN_CACHE_URL: https://cache.outrun.sh
+      OUTRUN_CACHE_TEAM: action-1793910645
+      NX_SELF_HOSTED_REMOTE_CACHE_SERVER: http://127.0.0.1:7070
+      NX_PARALLEL: "10"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: 36ae9b4d5e1ac4a0a4b2eb5e1e1d22bdb1f05aa0
+          fetch-depth: 0
+          persist-credentials: false
+      - name: netdiag scripts
+        run: |
+          mkdir -p "$RUNNER_TEMP/nd"
+          git fetch -q --depth 1 origin bench/netdiag
+          git show FETCH_HEAD:.github/netdiag/syn.py > "$RUNNER_TEMP/nd/syn.py"
+          command -v tcpdump >/dev/null || sudo apt-get install -y -qq tcpdump >/dev/null
+      - name: outrun
+        uses: arkadia-so/outrun@v1
+      - name: Start outrun nx-cache
+        run: |
+          nohup outrun nx-cache --port 7070 > "$RUNNER_TEMP/nx-cache.log" 2>&1 &
+          for i in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:7070/v1/cache/0 && break; sleep 0.2; done
+          cat "$RUNNER_TEMP/nx-cache.log"
+      - name: Setup Tools
+        uses: TanStack/config/.github/setup@e4b48f16568324f76f467aa4c2aac2f05db632c3
+      - name: Start capture
+        run: |
+          sudo tcpdump -i any -nn -s 96 -U -w "$RUNNER_TEMP/replay.pcap" 'tcp port 443 or icmp or icmp6' 2> "$RUNNER_TEMP/tcpdump.err" &
+          sleep 2
+          awk '/^TcpExt:/ { if (!x) { split($0, k); x=1 } else for (i=2;i<=NF;i++) if (k[i]=="TCPSynRetrans") print $i }' /proc/net/netstat > "$RUNNER_TEMP/synretx0"
+          date +%s.%N > "$RUNNER_TEMP/t0"
+      - name: Run Checks
+        run: pnpm run test:ci --exclude=@tanstack/vue-query-devtools,@tanstack/query-example-vue-simple-nuxt3
+      - name: Capture
+        if: always()
+        run: |
+          t1=$(date +%s.%N)
+          r1=$(awk '/^TcpExt:/ { if (!x) { split($0, k); x=1 } else for (i=2;i<=NF;i++) if (k[i]=="TCPSynRetrans") print $i }' /proc/net/netstat)
+          echo "TCPSynRetrans during Run Checks: +$((r1 - $(cat "$RUNNER_TEMP/synretx0")))"
+          sudo pkill -INT tcpdump; sleep 2
+          tail -3 "$RUNNER_TEMP/tcpdump.err"
+          tcpdump -nn -tt -r "$RUNNER_TEMP/replay.pcap" 2>/dev/null | python3 "$RUNNER_TEMP/nd/syn.py" "$(cat "$RUNNER_TEMP/t0")" "$t1" "Run Checks"
+          grep -c . "$RUNNER_TEMP/nx-cache.log" || true
+          tail -20 "$RUNNER_TEMP/nx-cache.log"
