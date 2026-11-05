@@ -4,6 +4,7 @@ name: PR
 # Nx. Nx stays the task runner; `outrun nx-cache` serves Nx's self-hosted remote cache API from
 # outrun's cache (its namespace per bench round: input `cache`). ARM64 (outrun-linux-arm64).
 # Same changes vs upstream as bench/outrun: workflow_dispatch, no Nx Cloud agents, test:ci.
+# bench/action: outrun from its published action (arkadia-so/outrun@v1), no committed CLI bundle.
 on:
   workflow_dispatch:
     inputs:
@@ -35,14 +36,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: 1.4.4
+      - name: outrun
+        uses: arkadia-so/outrun@v1
       - name: Start outrun nx-cache
         run: |
-          gunzip -c .github/outrun/outrun.js.gz > "$RUNNER_TEMP/outrun.js"
-          nohup bun "$RUNNER_TEMP/outrun.js" nx-cache --port 7070 > "$RUNNER_TEMP/nx-cache.log" 2>&1 &
+          nohup outrun nx-cache --port 7070 > "$RUNNER_TEMP/nx-cache.log" 2>&1 &
           for i in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:7070/v1/cache/0 && break; sleep 0.2; done
           cat "$RUNNER_TEMP/nx-cache.log"
       - name: Setup Tools
