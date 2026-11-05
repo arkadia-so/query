@@ -16,7 +16,7 @@ permissions: {}
 
 env:
   NX_NO_CLOUD: "true"
-  OUTRUN_CACHE_URL: https://turbo-cache.arkadia.so
+  OUTRUN_CACHE_URL: https://cache.outrun.sh
   OUTRUN_CACHE_TEAM: ${{ inputs.cache || 'outrun' }}
   NX_SELF_HOSTED_REMOTE_CACHE_SERVER: http://127.0.0.1:7070
   # A replay is a download, not CPU: more at once than nx.json's 5 (also applies to cold runs).
